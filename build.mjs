@@ -23,18 +23,21 @@ const SERVICES = [
   {name: 'Apple TV+', labels: ['Apple TV+', 'Apple TV']},
   {name: 'Hulu', labels: ['Hulu']},
   {name: 'Paramount+', labels: ['Paramount+', 'CBS All Access']},
-  {name: 'Peacock', labels: ['Peacock', 'Peacock TV', 'NBCUniversal Peacock']},
+  // (Peacock's Wikidata name isn't plain "Peacock": it's also found by its English Wikipedia article)
+  {name: 'Peacock', labels: ['Peacock', 'Peacock TV', 'NBCUniversal Peacock'], wiki: 'Peacock (streaming service)'},
 ];
 
 // what counts as a show: television series, miniseries, animated series, web series
 const TYPES = ['Q5398426', 'Q1259759', 'Q581714', 'Q526877'];
 
-function query(labels) {
+function query(labels, wiki) {
   const vals = labels.map(l => `"${l}"@en`).join(' ');
+  const byWiki = wiki
+    ? `UNION { ?article schema:about ?svc ; schema:isPartOf <https://en.wikipedia.org/> ; schema:name "${wiki}"@en . }`
+    : '';
   return `
 SELECT DISTINCT ?show ?title ?year WHERE {
-  VALUES ?svcLabel { ${vals} }
-  ?svc rdfs:label|skos:altLabel ?svcLabel .
+  { VALUES ?svcLabel { ${vals} } ?svc rdfs:label|skos:altLabel ?svcLabel . } ${byWiki}
   ?show wdt:P449|wdt:P750 ?svc .
   VALUES ?type { ${TYPES.map(t => 'wd:' + t).join(' ')} }
   ?show wdt:P31 ?type .
@@ -68,7 +71,7 @@ const counts = {};
 for (let s = 0; s < SERVICES.length; s++) {
   const svc = SERVICES[s];
   console.log(`${svc.name}...`);
-  const rows = await ask(query(svc.labels));
+  const rows = await ask(query(svc.labels, svc.wiki));
   const seen = new Set();
   for (const b of rows) {
     const title = b.title?.value?.trim();
