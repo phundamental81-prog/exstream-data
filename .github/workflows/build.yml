@@ -23,5 +23,5 @@ jobs:
         run: |
           git config user.name "exstream-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add services.json
-          git diff --cached --quiet || (git commit -m "Weekly streaming-service list" && git push)
+          git add services.json views.json
+          git diff --cached --quiet || (git commit -m "Daily streaming-service list" && git push)

@@ -185,40 +185,86 @@ for (let s = 0; s < SERVICES.length; s++) {
 if (kept.length === SERVICES.length) throw new Error('Wikidata never answered: keeping the old list');
 
 // ---- 2. how popular each show is (Wikipedia views, last 30 days) ----
+// Step 77c: measured: 24 at a time got "slow down" (429) 5,064 times and a third of the pages got no
+// count at all. So: the counts are kept in views.json (in this repository; the app never downloads it)
+// and each day only NEW pages and the ones over 7 days old are asked again (about 700 a day), 4 at a
+// time, waiting as long as Wikimedia says (Retry-After). A page that can't be asked today keeps its
+// last count, never 0.
 const day = d => d.toISOString().slice(0, 10).replace(/-/g, '');
 const end = new Date(Date.now() - 86400000); // yesterday (today isn't counted yet)
 const start = new Date(end.getTime() - 29 * 86400000);
+const today = new Date().toISOString().slice(0, 10);
+const daysAgo = d => (Date.parse(today) - Date.parse(d)) / 86400000;
+const KEEP_DAYS = 7;
+const WORKERS = 4;
+const BUDGET_MS = 15 * 60 * 1000; // stop asking after 15 minutes (the rest waits for tomorrow)
+
 const articles = [...new Set([...shows.values()].map(x => x.wp).filter(Boolean))];
-const views = new Map();
-let slowDowns = 0; // how often Wikimedia asked us to slow down (429)
-console.log(`popularity: ${articles.length} Wikipedia pages...`);
+// the saved counts: {"Page title": [views, "2026-11-25"], ...}
+let cache = {};
+if (existsSync('views.json')) {
+  try {
+    cache = JSON.parse(readFileSync('views.json', 'utf8')) || {};
+  } catch {}
+}
+// first run with this: start from the counts in the last list (they're from today or yesterday)
+if (!Object.keys(cache).length && old) {
+  const byKey = new Map(old.shows.map(x => [`${x[0]}|${x[1]}|${old.services[x[2]]}`, x[3]]));
+  for (const x of shows.values()) {
+    const v = byKey.get(`${x.title}|${x.year}|${SERVICES[x.svc].name}`);
+    if (x.wp && v > 0) cache[x.wp] = [v, old.built];
+  }
+  console.log(`  started the saved counts from the last list: ${Object.keys(cache).length} pages`);
+}
+// new pages first, then the oldest counts
+const due = articles
+  .filter(a => !cache[a] || daysAgo(cache[a][1]) >= KEEP_DAYS)
+  .sort((a, b) => (cache[a] ? Date.parse(cache[a][1]) : 0) - (cache[b] ? Date.parse(cache[b][1]) : 0));
+console.log(`popularity: ${articles.length} Wikipedia pages, ${due.length} to ask today (new, or over ${KEEP_DAYS} days old)...`);
+
+let slowDowns = 0, asked = 0, failed = 0;
 let next = 0;
+const t0 = Date.now();
 async function worker() {
-  while (next < articles.length) {
-    const a = articles[next++];
+  while (next < due.length && Date.now() - t0 < BUDGET_MS) {
+    const a = due[next++];
     const url = `${VIEWS}/${encodeURIComponent(a.replace(/ /g, '_'))}/daily/${day(start)}/${day(end)}`;
-    for (let tryN = 0; tryN < 3; tryN++) {
+    let done = false;
+    for (let tryN = 0; tryN < 6 && !done; tryN++) {
       try {
         const r = await fetch(url, {headers: {'User-Agent': UA}});
-        if (r.status === 404) break; // no views recorded
-        if (r.status === 429) {
-          slowDowns++;
-          await sleep(2000 * (tryN + 1));
+        if (r.status === 429 || r.status >= 500) {
+          if (r.status === 429) slowDowns++;
+          const wait = Number(r.headers.get('retry-after')) || 2 ** tryN; // as long as they ask (or 1, 2, 4... s)
+          await sleep(Math.min(wait, 60) * 1000);
           continue;
         }
-        if (!r.ok) break;
-        const j = await r.json();
-        views.set(a, (j.items || []).reduce((n, it) => n + (it.views || 0), 0));
-        break;
+        if (r.status === 404) {
+          cache[a] = [0, today]; // no views recorded (a new or tiny page)
+        } else if (r.ok) {
+          const j = await r.json();
+          cache[a] = [(j.items || []).reduce((n, it) => n + (it.views || 0), 0), today];
+        }
+        done = true;
       } catch {
-        await sleep(1000);
+        await sleep(1000 * (tryN + 1));
       }
     }
+    if (done) asked++;
+    else failed++;
   }
 }
-const t0 = Date.now();
-await Promise.all(Array.from({length: 24}, worker)); // 24 at a time (Wikimedia allows far more from a named bot)
-console.log(`  views for ${views.size} pages in ${Math.round((Date.now() - t0) / 1000)} s (asked to slow down ${slowDowns} times)`);
+await Promise.all(Array.from({length: WORKERS}, worker));
+const views = new Map();
+for (const a of articles) if (cache[a]) views.set(a, cache[a][0]);
+console.log(
+  `  asked ${asked} pages in ${Math.round((Date.now() - t0) / 1000)} s (asked to slow down ${slowDowns} times, ${failed} failed, ` +
+    `${due.length - asked - failed} left for tomorrow) · counts for ${views.size} of ${articles.length} pages`,
+);
+// keep only pages still in use
+const keepViews = {};
+for (const a of articles) if (cache[a]) keepViews[a] = cache[a];
+writeFileSync('views.json', JSON.stringify(keepViews));
 
 // ---- 3. the safety check (keep the last good list if this run looks wrong) ----
 const total = shows.size;
