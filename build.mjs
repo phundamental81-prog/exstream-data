@@ -15,9 +15,13 @@
 // The ExStream app checks for a new one once a day (downloaded only when it changed) and matches
 // shows by title + year on the device. Nothing about any user, provider or app is in here.
 //
-// Safety: a service that comes back empty is left out (with a warning); if the list as a whole looks
-// wrong (under 800 shows, or 30% fewer than last time), the old services.json is kept and the job
-// fails, so the app never gets a broken list.
+// How it asks (light questions, so a busy Wikidata doesn't time out): one small question first finds
+// the ID of every service and channel; then each service's shows are fetched by those IDs.
+//
+// Safety: if one service can't be fetched (Wikidata busy), it keeps its shows from the last good list
+// and the others still update. A service that comes back empty is left out (with a warning). If the
+// list as a whole looks wrong (under 800 shows, or 30% fewer than last time), the old services.json
+// is kept and the job fails, so the app never gets a broken list.
 import {readFileSync, writeFileSync, existsSync} from 'node:fs';
 
 const UA = 'ExStreamDataBot/1.0 (https://github.com/phundamental81-prog/exstream-data)';
@@ -34,7 +38,8 @@ const SERVICES = [
   {name: 'HBO Max', labels: ['HBO Max', 'Max'], channels: ['HBO', 'Cinemax', 'TLC (TV network)', 'Discovery Channel', 'HGTV', 'Food Network']},
   {name: 'Disney+', labels: ['Disney+', 'Disney Plus'], channels: ['Disney Channel', 'Disney Jr.', 'Disney XD', 'National Geographic (American TV channel)']},
   {name: 'Prime Video', labels: ['Prime Video', 'Amazon Prime Video', 'Amazon Video'], channels: ['Amazon Freevee']},
-  {name: 'Apple TV+', labels: ['Apple TV+']},
+  // renamed from Apple TV+ in Oct 2025: found through its Wikipedia article so a new name can't lose it
+  {name: 'Apple TV', labels: ['Apple TV+'], wiki: ['Apple TV (streaming service)', 'Apple TV+']},
   {name: 'Hulu', labels: ['Hulu'], channels: ['American Broadcasting Company', 'FX (TV channel)', 'Freeform (TV channel)']},
   {name: 'Paramount+', labels: ['Paramount+', 'CBS All Access'], channels: ['CBS', 'Showtime (TV network)', 'Comedy Central', 'MTV', 'Nickelodeon']},
   {name: 'Peacock', labels: ['Peacock TV'], wiki: ['Peacock (streaming service)'], channels: ['NBC', 'Bravo (American TV network)', 'USA Network']},
@@ -47,14 +52,31 @@ const SERVICES = [
 const TYPES = ['Q5398426', 'Q1259759', 'Q581714', 'Q526877'];
 
 const lit = s => `"${s.replace(/"/g, '\\"')}"@en`;
-function query(svc) {
-  const own = [`{ VALUES ?l { ${svc.labels.map(lit).join(' ')} } ?svc rdfs:label|skos:altLabel ?l . }`];
-  if (svc.wiki?.length) own.push(`{ VALUES ?w { ${svc.wiki.map(lit).join(' ')} } ?wa schema:about ?svc ; schema:isPartOf <https://en.wikipedia.org/> ; schema:name ?w . }`);
-  const parts = [`{ ${own.join(' UNION ')} BIND(1 AS ?own) }`];
-  if (svc.channels?.length) parts.push(`{ VALUES ?c { ${svc.channels.map(lit).join(' ')} } ?ca schema:about ?svc ; schema:isPartOf <https://en.wikipedia.org/> ; schema:name ?c . BIND(0 AS ?own) }`);
+const EN_WIKI = '<https://en.wikipedia.org/>';
+
+// step A: the Wikidata IDs of every service ("s3") and of the channels it owns ("c3"), in ONE question.
+// A name match only counts if something actually aired on it ("Max" is also lots of other things).
+function idQuery() {
+  const names = [], pages = [];
+  SERVICES.forEach((svc, i) => {
+    for (const l of svc.labels) names.push(`("s${i}" ${lit(l)})`);
+    for (const w of svc.wiki || []) pages.push(`("s${i}" ${lit(w)})`);
+    for (const c of svc.channels || []) pages.push(`("c${i}" ${lit(c)})`);
+  });
+  return `
+SELECT DISTINCT ?k ?item WHERE {
+  { VALUES (?k ?l) { ${names.join(' ')} } ?item rdfs:label|skos:altLabel ?l . FILTER EXISTS { ?x wdt:P449 ?item } }
+  UNION
+  { VALUES (?k ?w) { ${pages.join(' ')} } ?a schema:name ?w ; schema:isPartOf ${EN_WIKI} ; schema:about ?item . }
+}`;
+}
+
+// step B: one service's shows, by ID (own = 1: the service itself, 0: a channel it owns)
+function showQuery(own, chans) {
+  const vals = [...own.map(q => `(wd:${q} 1)`), ...chans.map(q => `(wd:${q} 0)`)].join(' ');
   return `
 SELECT DISTINCT ?show ?title ?year ?wp ?own WHERE {
-  ${parts.join(' UNION ')}
+  VALUES (?svc ?own) { ${vals} }
   ?show wdt:P449 ?svc .
   VALUES ?type { ${TYPES.map(t => 'wd:' + t).join(' ')} }
   ?show wdt:P31 ?type .
@@ -62,7 +84,7 @@ SELECT DISTINCT ?show ?title ?year ?wp ?own WHERE {
   OPTIONAL { ?show wdt:P580 ?start }
   OPTIONAL { ?show wdt:P577 ?pub }
   BIND(YEAR(COALESCE(?start, ?pub)) AS ?year)
-  OPTIONAL { ?pa schema:about ?show ; schema:isPartOf <https://en.wikipedia.org/> ; schema:name ?wp . }
+  OPTIONAL { ?pa schema:about ?show ; schema:isPartOf ${EN_WIKI} ; schema:name ?wp . }
 }`;
 }
 
@@ -80,36 +102,74 @@ async function ask(sparql, tries = 3) {
     } catch (e) {
       console.log(`  try ${i} failed: ${e.message}`);
       if (i === tries) throw e;
-      await sleep(15000 * i); // Wikidata asks us to back off
+      await sleep(30000 * i); // Wikidata asks us to back off: 30 s, then 60 s
     }
   }
 }
 
 // ---- 1. the shows of each service ----
-const shows = new Map(); // "title|year|svc" -> {title, year, svc, wp}
+// the last good list (same version): a service that can't be fetched today keeps its shows from it
+let old = null;
+if (existsSync('services.json')) {
+  try {
+    const o = JSON.parse(readFileSync('services.json', 'utf8'));
+    if (o.v === V) old = o;
+  } catch {}
+}
+
+console.log('finding the services and their channels...');
+const ids = SERVICES.map(() => ({own: new Set(), chans: new Set()}));
+for (const b of await ask(idQuery())) {
+  const k = b.k.value, q = b.item.value.split('/').pop();
+  const i = Number(k.slice(1));
+  (k[0] === 's' ? ids[i].own : ids[i].chans).add(q);
+}
+
+const shows = new Map(); // "title|year|svc" -> {title, year, svc, wp, views?}
 const counts = {};
+const kept = [];
 for (let s = 0; s < SERVICES.length; s++) {
   const svc = SERVICES[s];
-  console.log(`${svc.name}...`);
-  const rows = await ask(query(svc));
+  const {own, chans} = ids[s];
+  console.log(`${svc.name}... (${own.size} service ID, ${chans.size} of ${svc.channels?.length || 0} channels found)`);
+  if (svc.channels?.length && chans.size < svc.channels.length) console.log(`::warning::${svc.name}: a channel's Wikipedia page wasn't found (renamed?)`);
+  let rows = null;
+  if (own.size || chans.size) {
+    try {
+      rows = await ask(showQuery([...own], [...chans]));
+    } catch {}
+  } else {
+    rows = []; // not found at all: left out below (with a warning)
+  }
+  if (rows === null) {
+    // Wikidata didn't answer: keep this service's shows from the last good list
+    const oi = old ? old.services.indexOf(svc.name) : -1;
+    const prev = oi < 0 ? [] : old.shows.filter(x => x[2] === oi);
+    for (const [title, year, , v] of prev) shows.set(`${title}|${year}|${s}`, {title, year, svc: s, wp: '', views: v});
+    counts[svc.name] = prev.length;
+    kept.push(svc.name);
+    console.log(`::warning::${svc.name}: Wikidata didn't answer, kept ${prev.length} shows from the last list`);
+    continue;
+  }
   const seen = new Set();
   let fromChannels = 0;
   for (const b of rows) {
     const title = b.title?.value?.trim();
     if (!title) continue;
     const year = b.year ? Number(b.year.value) || 0 : 0;
-    const own = b.own?.value === '1';
-    if (!own && year < CHANNEL_FROM) continue; // channel shows: recent ones only
+    const isOwn = b.own?.value === '1';
+    if (!isOwn && year < CHANNEL_FROM) continue; // channel shows: recent ones only
     const id = b.show.value;
     if (seen.has(id)) continue;
     seen.add(id);
-    if (!own) fromChannels++;
+    if (!isOwn) fromChannels++;
     shows.set(`${title}|${year}|${s}`, {title, year, svc: s, wp: b.wp?.value || ''});
   }
   counts[svc.name] = seen.size;
   console.log(`  ${seen.size} shows (${fromChannels} from its channels)`);
   await sleep(3000); // be polite to Wikidata
 }
+if (kept.length === SERVICES.length) throw new Error('Wikidata never answered: keeping the old list');
 
 // ---- 2. how popular each show is (Wikipedia views, last 30 days) ----
 const day = d => d.toISOString().slice(0, 10).replace(/-/g, '');
@@ -147,13 +207,7 @@ console.log(`  views for ${views.size} pages`);
 // ---- 3. the safety check (keep the last good list if this run looks wrong) ----
 const total = shows.size;
 const empty = Object.entries(counts).filter(([, n]) => n === 0).map(([k]) => k);
-let before = 0;
-if (existsSync('services.json')) {
-  try {
-    const old = JSON.parse(readFileSync('services.json', 'utf8'));
-    if (old.v === V) before = old.shows.length;
-  } catch {}
-}
+const before = old ? old.shows.length : 0;
 console.log(`total ${total} (last list ${before || 'n/a'})`);
 if (empty.length) console.log(`::warning::no shows for ${empty.join(', ')} this time (left out)`);
 if (total < 800) throw new Error(`only ${total} shows in all: keeping the old list`);
@@ -167,7 +221,7 @@ const out = {
   services: SERVICES.map(s => s.name),
   counts,
   shows: [...shows.values()]
-    .map(x => [x.title, x.year, x.svc, views.get(x.wp) || 0])
+    .map(x => [x.title, x.year, x.svc, views.get(x.wp) || x.views || 0])
     .sort((a, b) => a[2] - b[2] || b[3] - a[3] || a[0].localeCompare(b[0])),
 };
 writeFileSync('services.json', JSON.stringify(out));
