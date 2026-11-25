@@ -1,7 +1,10 @@
 // ExStream streaming-service list builder (runs weekly on GitHub Actions)
 //
-// Asks Wikidata (free, CC0) which TV shows each streaming service made or carries: the show's
-// "original broadcaster" (P449) or "distributed by" (P750) is the service. Writes services.json:
+// Asks Wikidata (free, CC0) which TV shows each streaming service MADE or FIRST AIRED: the show's
+// "original broadcaster" (P449) is the service (or its own channel: HBO for HBO Max, Showtime for
+// Paramount+, CBC Television for CBC Gem). Not "distributed by" (P750): that's "somewhere in the
+// world", and put shows like Heartland under Netflix, where they aren't for Canadian viewers.
+// Writes services.json:
 //   {v, built, services: ["Netflix", ...], shows: [[title, firstYear, serviceIndex], ...]}
 // The ExStream app downloads it once a week and matches shows by title + year on the device.
 // Nothing about any user, provider or app is in here.
@@ -22,9 +25,12 @@ const SERVICES = [
   {name: 'Prime Video', labels: ['Prime Video', 'Amazon Prime Video', 'Amazon Video']},
   {name: 'Apple TV+', labels: ['Apple TV+', 'Apple TV']},
   {name: 'Hulu', labels: ['Hulu']},
-  {name: 'Paramount+', labels: ['Paramount+', 'CBS All Access']},
+  {name: 'Paramount+', labels: ['Paramount+', 'CBS All Access', 'Showtime', 'Paramount+ with Showtime']},
   // (Peacock's Wikidata name isn't plain "Peacock": it's also found by its English Wikipedia article)
   {name: 'Peacock', labels: ['Peacock', 'Peacock TV', 'NBCUniversal Peacock'], wiki: 'Peacock (streaming service)'},
+  // Canada (the app also shows HBO's shows under Crave on Canadian boxes: HBO streams on Crave there)
+  {name: 'Crave', labels: ['Crave', 'CraveTV'], wiki: 'Crave (streaming service)'},
+  {name: 'CBC Gem', labels: ['CBC Gem', 'CBC Television'], wiki: 'CBC Gem'},
 ];
 
 // what counts as a show: television series, miniseries, animated series, web series
@@ -38,7 +44,7 @@ function query(labels, wiki) {
   return `
 SELECT DISTINCT ?show ?title ?year WHERE {
   { VALUES ?svcLabel { ${vals} } ?svc rdfs:label|skos:altLabel ?svcLabel . } ${byWiki}
-  ?show wdt:P449|wdt:P750 ?svc .
+  ?show wdt:P449 ?svc .
   VALUES ?type { ${TYPES.map(t => 'wd:' + t).join(' ')} }
   ?show wdt:P31 ?type .
   ?show rdfs:label ?title . FILTER(LANG(?title) = "en")
@@ -91,20 +97,22 @@ for (let s = 0; s < SERVICES.length; s++) {
 const total = shows.size;
 const empty = Object.entries(counts).filter(([, n]) => n === 0).map(([k]) => k);
 let before = 0;
+const V = 2; // v2: original broadcaster only (+ Crave, CBC Gem). A new version isn't compared with the old.
 if (existsSync('services.json')) {
   try {
-    before = JSON.parse(readFileSync('services.json', 'utf8')).shows.length;
+    const old = JSON.parse(readFileSync('services.json', 'utf8'));
+    if (old.v === V) before = old.shows.length;
   } catch {}
 }
 console.log(`total ${total} (last list ${before})`);
 if (empty.length) console.log(`::warning::no shows for ${empty.join(', ')} this week (left out)`);
-if (total < 1000) throw new Error(`only ${total} shows in all: keeping the old list`);
+if (total < 800) throw new Error(`only ${total} shows in all: keeping the old list`);
 if (before && total < before * 0.7) throw new Error(`only ${total} shows (was ${before}): keeping the old list`);
 
 const out = {
-  v: 1,
+  v: V,
   built: new Date().toISOString().slice(0, 10),
-  source: 'Wikidata (CC0): original broadcaster (P449) / distributed by (P750)',
+  source: 'Wikidata (CC0): original broadcaster (P449)',
   services: SERVICES.map(s => s.name),
   counts,
   shows: [...shows.values()].sort((a, b) => a[2] - b[2] || a[0].localeCompare(b[0]) || a[1] - b[1]),
