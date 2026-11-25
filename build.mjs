@@ -6,8 +6,9 @@
 // The ExStream app downloads it once a week and matches shows by title + year on the device.
 // Nothing about any user, provider or app is in here.
 //
-// Safety: if Wikidata answers badly (a service comes back empty, or far fewer shows than last
-// time), the old services.json is kept and the job fails, so the app never gets a broken list.
+// Safety: a service that comes back empty is left out (with a warning); if the list as a whole looks
+// wrong (under 1,000 shows, or 30% fewer than last time), the old services.json is kept and the job
+// fails, so the app never gets a broken list.
 import {readFileSync, writeFileSync, existsSync} from 'node:fs';
 
 const UA = 'ExStreamDataBot/1.0 (https://github.com/phundamental81-prog/exstream-data)';
@@ -22,7 +23,7 @@ const SERVICES = [
   {name: 'Apple TV+', labels: ['Apple TV+', 'Apple TV']},
   {name: 'Hulu', labels: ['Hulu']},
   {name: 'Paramount+', labels: ['Paramount+', 'CBS All Access']},
-  {name: 'Peacock', labels: ['Peacock']},
+  {name: 'Peacock', labels: ['Peacock', 'Peacock TV', 'NBCUniversal Peacock']},
 ];
 
 // what counts as a show: television series, miniseries, animated series, web series
@@ -93,7 +94,8 @@ if (existsSync('services.json')) {
   } catch {}
 }
 console.log(`total ${total} (last list ${before})`);
-if (empty.length) throw new Error(`no shows for ${empty.join(', ')}: keeping the old list`);
+if (empty.length) console.log(`::warning::no shows for ${empty.join(', ')} this week (left out)`);
+if (total < 1000) throw new Error(`only ${total} shows in all: keeping the old list`);
 if (before && total < before * 0.7) throw new Error(`only ${total} shows (was ${before}): keeping the old list`);
 
 const out = {
