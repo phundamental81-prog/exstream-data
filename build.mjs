@@ -88,6 +88,19 @@ SELECT DISTINCT ?show ?title ?year ?wp ?own WHERE {
 }`;
 }
 
+// "Scrubs (2026)" / "Ghosts (American TV series)" -> "Scrubs" / "Ghosts" (the tag isn't part of the
+// name people know; a year in it is kept as the year)
+function tidyTitle(raw) {
+  let title = String(raw || '').trim();
+  let tagYear = 0;
+  const m = title.match(/\s*\(([^()]*)\)\s*$/);
+  if (m && (/^\d{4}$/.test(m[1].trim()) || /\b(mini)?series$/i.test(m[1].trim()))) {
+    title = title.slice(0, m.index).trim();
+    tagYear = Number(m[1].match(/\b(?:19|20)\d{2}\b/)?.[0]) || 0;
+  }
+  return {title, tagYear};
+}
+
 const sleep = ms => new Promise(res => setTimeout(res, ms));
 async function ask(sparql, tries = 3) {
   for (let i = 1; i <= tries; i++) {
@@ -154,9 +167,9 @@ for (let s = 0; s < SERVICES.length; s++) {
   const seen = new Set();
   let fromChannels = 0;
   for (const b of rows) {
-    const title = b.title?.value?.trim();
+    const {title, tagYear} = tidyTitle(b.title?.value);
     if (!title) continue;
-    const year = b.year ? Number(b.year.value) || 0 : 0;
+    const year = (b.year ? Number(b.year.value) || 0 : 0) || tagYear;
     const isOwn = b.own?.value === '1';
     if (!isOwn && year < CHANNEL_FROM) continue; // channel shows: recent ones only
     const id = b.show.value;
@@ -177,6 +190,7 @@ const end = new Date(Date.now() - 86400000); // yesterday (today isn't counted y
 const start = new Date(end.getTime() - 29 * 86400000);
 const articles = [...new Set([...shows.values()].map(x => x.wp).filter(Boolean))];
 const views = new Map();
+let slowDowns = 0; // how often Wikimedia asked us to slow down (429)
 console.log(`popularity: ${articles.length} Wikipedia pages...`);
 let next = 0;
 async function worker() {
@@ -188,6 +202,7 @@ async function worker() {
         const r = await fetch(url, {headers: {'User-Agent': UA}});
         if (r.status === 404) break; // no views recorded
         if (r.status === 429) {
+          slowDowns++;
           await sleep(2000 * (tryN + 1));
           continue;
         }
@@ -201,8 +216,9 @@ async function worker() {
     }
   }
 }
-await Promise.all(Array.from({length: 8}, worker)); // 8 at a time (Wikimedia allows far more)
-console.log(`  views for ${views.size} pages`);
+const t0 = Date.now();
+await Promise.all(Array.from({length: 24}, worker)); // 24 at a time (Wikimedia allows far more from a named bot)
+console.log(`  views for ${views.size} pages in ${Math.round((Date.now() - t0) / 1000)} s (asked to slow down ${slowDowns} times)`);
 
 // ---- 3. the safety check (keep the last good list if this run looks wrong) ----
 const total = shows.size;
