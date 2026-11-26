@@ -88,6 +88,37 @@ SELECT DISTINCT ?show ?title ?year ?wp ?own WHERE {
 }`;
 }
 
+// step C: the other names each show is known by (Wikidata's English alternative names and its French
+// name: "Marvel's Agents of S.H.I.E.L.D.", "Mythic Quest: Raven's Banquet", "Coroner : la voix des
+// victimes"), so a provider's name for it matches too (the app still checks the year). A separate,
+// light question per service: if it fails, the shows simply have no other names today.
+function altQuery(own, chans) {
+  const vals = [...own, ...chans].map(q => `wd:${q}`).join(' ');
+  return `
+SELECT ?show (GROUP_CONCAT(DISTINCT ?a; separator="|") AS ?alts) WHERE {
+  VALUES ?svc { ${vals} }
+  ?show wdt:P449 ?svc .
+  VALUES ?type { ${TYPES.map(t => 'wd:' + t).join(' ')} }
+  ?show wdt:P31 ?type .
+  { ?show skos:altLabel ?a . FILTER(LANG(?a) = "en") } UNION { ?show rdfs:label ?a . FILTER(LANG(?a) = "fr") }
+} GROUP BY ?show`;
+}
+const MAX_ALTS = 6;
+const simple = s => s.normalize('NFD').replace(/\p{M}+/gu, '').toUpperCase().replace(/[^\p{L}\p{N}]+/gu, '');
+function cleanAlts(raw, title) {
+  const out = [];
+  const seen = new Set([simple(title)]);
+  for (const a of String(raw || '').split('|')) {
+    const t = tidyTitle(a).title;
+    const k = simple(t);
+    if (k.length < 5 || seen.has(k)) continue; // too short to be safe ("AoS"), or the same as the title
+    seen.add(k);
+    out.push(t);
+    if (out.length >= MAX_ALTS) break;
+  }
+  return out;
+}
+
 // "Scrubs (2026)" / "Ghosts (American TV series)" -> "Scrubs" / "Ghosts" (the tag isn't part of the
 // name people know; a year in it is kept as the year)
 function tidyTitle(raw) {
@@ -158,7 +189,7 @@ for (let s = 0; s < SERVICES.length; s++) {
     // Wikidata didn't answer: keep this service's shows from the last good list
     const oi = old ? old.services.indexOf(svc.name) : -1;
     const prev = oi < 0 ? [] : old.shows.filter(x => x[2] === oi);
-    for (const [title, year, , v] of prev) shows.set(`${title}|${year}|${s}`, {title, year, svc: s, wp: '', views: v});
+    for (const [title, year, , v, alts] of prev) shows.set(`${title}|${year}|${s}`, {title, year, svc: s, wp: '', views: v, alts: alts || []});
     counts[svc.name] = prev.length;
     kept.push(svc.name);
     console.log(`::warning::${svc.name}: Wikidata didn't answer, kept ${prev.length} shows from the last list`);
@@ -176,10 +207,24 @@ for (let s = 0; s < SERVICES.length; s++) {
     if (seen.has(id)) continue;
     seen.add(id);
     if (!isOwn) fromChannels++;
-    shows.set(`${title}|${year}|${s}`, {title, year, svc: s, wp: b.wp?.value || ''});
+    shows.set(`${title}|${year}|${s}`, {title, year, svc: s, wp: b.wp?.value || '', id});
   }
   counts[svc.name] = seen.size;
   console.log(`  ${seen.size} shows (${fromChannels} from its channels)`);
+  // the other names (a failure here only means no other names today)
+  try {
+    await sleep(2000);
+    const alts = new Map((await ask(altQuery([...own], [...chans]), 1)).map(b => [b.show.value, b.alts?.value || '']));
+    let withAlts = 0;
+    for (const x of shows.values()) {
+      if (x.svc !== s || !x.id) continue;
+      x.alts = cleanAlts(alts.get(x.id), x.title);
+      if (x.alts.length) withAlts++;
+    }
+    console.log(`  other names for ${withAlts} shows`);
+  } catch {
+    console.log(`::warning::${svc.name}: no other names today (Wikidata didn't answer)`);
+  }
   await sleep(3000); // be polite to Wikidata
 }
 if (kept.length === SERVICES.length) throw new Error('Wikidata never answered: keeping the old list');
@@ -283,7 +328,11 @@ const out = {
   services: SERVICES.map(s => s.name),
   counts,
   shows: [...shows.values()]
-    .map(x => [x.title, x.year, x.svc, views.get(x.wp) || x.views || 0])
+    .map(x => {
+      const row = [x.title, x.year, x.svc, views.get(x.wp) || x.views || 0];
+      if (x.alts?.length) row.push(x.alts); // [title, year, service, views, [other names]]
+      return row;
+    })
     .sort((a, b) => a[2] - b[2] || b[3] - a[3] || a[0].localeCompare(b[0])),
 };
 writeFileSync('services.json', JSON.stringify(out));
